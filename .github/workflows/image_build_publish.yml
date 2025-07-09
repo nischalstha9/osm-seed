@@ -1,0 +1,145 @@
+name: Publish only changed images to GHCR
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - "images/**/Dockerfile"
+      - "images/**"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: "Force rebuild all images"
+        required: false
+        default: "false"
+        type: boolean
+      specific_image:
+        description: "Rebuild specific image (leave empty for all changed)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  detect-changed:
+    name: Determine which images changed
+    runs-on: ubuntu-latest
+    outputs:
+      images-json: ${{ steps.set-dirs.outputs.dirs }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: List changed image dirs
+        id: set-dirs
+        run: |
+          set -e
+
+          # Handle workflow_dispatch with force rebuild or specific image
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.force_rebuild }}" = "true" ]; then
+              echo "Force rebuild requested - detecting all available images"
+              IMAGES=$(find images -maxdepth 1 -mindepth 1 -type d -exec basename {} \; | sort)
+            elif [ -n "${{ inputs.specific_image }}" ]; then
+              echo "Specific image rebuild requested: ${{ inputs.specific_image }}"
+              IMAGES="${{ inputs.specific_image }}"
+            else
+              echo "Manual trigger without force rebuild - no images to build"
+              IMAGES=""
+            fi
+          else
+            # Handle push event - detect changed images
+            echo "Push event - detecting changed images"
+            
+            # Get list of files changed in this push
+            if [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+              CHANGED_FILES=$(git diff --name-only ${{ github.event.before }} ${{ github.sha }})
+            else
+              # First push to branch - compare with HEAD~1
+              CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+            fi
+            
+            echo "Changed files:"
+            echo "$CHANGED_FILES"
+            
+            # Extract the second path component of any images/foo/... change
+            IMAGES=$(echo "$CHANGED_FILES" \
+              | grep -E '^images/[^/]+/' || true \
+              | awk -F/ '{print $2}' \
+              | sort -u)
+          fi
+
+          if [ -z "$IMAGES" ]; then
+            echo "No images to build"
+            echo "dirs=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "Images to build: $IMAGES"
+            # Build JSON array: ["foo","bar",...]
+            # Use printf to create a properly formatted JSON array
+            JSON="["
+            FIRST=true
+            for image in $IMAGES; do
+              if [ "$FIRST" = true ]; then
+                JSON="${JSON}\"${image}\""
+                FIRST=false
+              else
+                JSON="${JSON},\"${image}\""
+              fi
+            done
+            JSON="${JSON}]"
+            echo "dirs=$JSON" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Debug show detected dirs
+        run: |
+          echo "→ will build: ${{ steps.set-dirs.outputs.dirs }}"
+
+  build-and-push:
+    name: Build & Push changed images
+    needs: detect-changed
+    runs-on: ubuntu-latest
+    # Skip entirely if no dirs changed
+    if: needs.detect-changed.outputs.images-json != '[]'
+    strategy:
+      matrix:
+        image: ${{ fromJson(needs.detect-changed.outputs.images-json) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/nischalstha9/osm-seed-${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & Push multi-platform ${{ matrix.image }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ./images/${{ matrix.image }}
+          file: ./images/${{ matrix.image }}/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
